@@ -13,8 +13,8 @@ const generateLastModifiedDateFilter = (date, nowDate, propertyName = 'hs_lastmo
   const lastModifiedDateFilter = date ?
     {
       filters: [
-        { propertyName, operator: 'GTQ', value: `${date.valueOf()}` },
-        { propertyName, operator: 'LTQ', value: `${nowDate.valueOf()}` }
+        { propertyName, operator: 'GT', value: `${date.valueOf()}` },
+        { propertyName, operator: 'LT', value: `${nowDate.valueOf()}` }
       ]
     } :
     {};
@@ -262,6 +262,80 @@ const processContacts = async (domain, hubId, q) => {
   return true;
 };
 
+const processMeetings = async (domain, hubId, q) => {
+  const account = domain.integrations.hubspot.accounts.find(acc => acc.hubId === hubId);
+  const lastPulledDate = new Date(account.lastPulledDates.meetings);
+  const now = new Date();
+
+  let after = undefined;
+  const limit = 100;
+
+  while (true) {
+    let response;
+
+    try {
+      response = await hubspotClient.crm.objects.meetings.basicApi.getPage(limit, after, [
+        'hs_timestamp',
+        'hs_meeting_title',
+        'hs_meeting_body',
+        'createdate',
+        'lastmodifieddate',
+      ]);
+    } catch (err) {
+      console.error('Error fetching meetings:', err.message);
+      throw err;
+    }
+
+    const meetings = response.results || [];
+
+    for (const meeting of meetings) {
+      const isCreated = !lastPulledDate || new Date(meeting.properties.createdate) > lastPulledDate;
+      const actionName = isCreated ? 'Meeting Created' : 'Meeting Updated';
+      const actionDate = new Date(isCreated ? meeting.properties.hs_createdate : meeting.properties.hs_lastmodifieddate);
+
+      // Get associated contact(s)
+      let contactEmail = null;
+
+      try {
+        const assoc = await hubspotClient.crm.objects.meetings.associationsApi.getAll(meeting.id, 'contacts');
+
+        if (!assoc.results.length) {
+          // console.warn(`No associated contacts found for meeting ${meeting.id}`);
+        } else {
+          const contactId = assoc.results[0].toObjectId;
+          // console.log(`Associated contact ID for meeting ${meeting.id}:`, contactId);
+
+          const contact = await hubspotClient.crm.contacts.basicApi.getById(contactId, ['email']);
+          contactEmail = contact.properties?.email;
+
+          if (!contactEmail) {
+            console.warn(`Contact ${contactId} has no email.`);
+          }
+        }
+      } catch (e) {
+        console.warn(`Could not fetch contact for meeting ${meeting.id}:`, e.message);
+      }
+
+      q.push({
+        actionName,
+        actionDate,
+        contact: contactEmail,
+        meetingProperties: {
+          id: meeting.id,
+          title: meeting.properties.hs_meeting_title,
+          startTime: meeting.properties.hs_timestamp,
+        },
+      });
+    }
+
+    after = response.paging?.next?.after;
+    if (!after) break;
+  }
+
+  account.lastPulledDates.meetings = now;
+  await saveDomain(domain);
+};
+
 const createQueue = (domain, actions) => queue(async (action, callback) => {
   actions.push(action);
 
@@ -316,6 +390,13 @@ const pullDataFromHubspot = async () => {
       console.log('process companies');
     } catch (err) {
       console.log(err, { apiKey: domain.apiKey, metadata: { operation: 'processCompanies', hubId: account.hubId } });
+    }
+
+    try {
+      await processMeetings(domain, account.hubId, q);
+      console.log('process meetings');
+    } catch (err) {
+      console.log(err, { apiKey: domain.apiKey, metadata: { operation: 'processMeetings', hubId: account.hubId } });
     }
 
     try {
